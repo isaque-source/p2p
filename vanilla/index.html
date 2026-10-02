@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DropP2P - Transferência Local P2P (Vanilla)</title>
+  <link rel="stylesheet" href="style.css">
+  <!-- Socket.io Client -->
+  <script src="/socket.io/socket.io.js"></script>
+</head>
+<body>
+  <!-- Cabeçalho -->
+  <header class="app-header">
+    <div class="header-left">
+      <div class="logo-icon">⚡</div>
+      <div>
+        <h1 class="logo-title">DropP2P <span class="badge">P2P Local</span></h1>
+        <p class="logo-subtitle">Transferência direta no navegador estilo AirDrop</p>
+      </div>
+    </div>
+
+    <div class="header-right">
+      <div id="network-chip" class="network-chip" title="Clique para alternar sala">
+        <span class="online-indicator"></span>
+        <span id="room-label">Detectando rede...</span>
+      </div>
+      <div id="self-profile-chip" class="profile-chip">
+        <div id="self-avatar" class="avatar-small">⚡</div>
+        <div class="profile-details">
+          <span id="self-name" class="self-name">Você</span>
+          <span id="self-os" class="self-os">Dispositivo</span>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <!-- Área Principal do Radar -->
+  <main class="radar-arena" id="radar-arena">
+    <!-- Círculos concêntricos animados de radar -->
+    <div class="radar-circles-container">
+      <div class="radar-wave wave-1"></div>
+      <div class="radar-wave wave-2"></div>
+      <div class="radar-wave wave-3"></div>
+      <div class="radar-circle-static circle-1"></div>
+      <div class="radar-circle-static circle-2"></div>
+    </div>
+
+    <!-- Mensagem de status central -->
+    <div id="arena-status" class="arena-status">
+      Procurando outros dispositivos na mesma rede Wi-Fi...
+    </div>
+
+    <!-- Lista central de dispositivos online -->
+    <div id="devices-container" class="devices-container">
+      <!-- Os cartões de pares descobertos serão injetados dinamicamente aqui -->
+    </div>
+
+    <!-- Dispositivo do usuário (base do radar) -->
+    <div class="self-dock">
+      <div class="self-dock-card">
+        <div id="dock-avatar" class="dock-avatar">⚡</div>
+        <div>
+          <span id="dock-name" class="dock-title">Seu Dispositivo</span>
+          <span class="dock-subtitle">Pronto para enviar e receber</span>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <!-- Input de arquivo invisível para clique no par -->
+  <input type="file" id="file-input" style="display: none;">
+
+  <!-- Modal de Solicitação de Arquivo (Aceitar / Recusar) -->
+  <div id="incoming-modal" class="modal-overlay hidden">
+    <div class="modal-card">
+      <div class="modal-timer-bar"><div id="timer-progress" class="timer-progress"></div></div>
+      <div class="modal-header">
+        <div id="modal-sender-avatar" class="avatar-medium">🦊</div>
+        <div>
+          <span class="modal-tag">Solicitação AirDrop</span>
+          <h3 id="modal-sender-name" class="modal-title">Dispositivo Remoto</h3>
+          <p id="modal-sender-os" class="modal-subtitle">Na mesma rede local</p>
+        </div>
+      </div>
+      <div class="modal-file-box">
+        <div class="file-icon">📁</div>
+        <div class="file-info">
+          <div id="modal-file-name" class="file-name">documento.pdf</div>
+          <div id="modal-file-size" class="file-size">14.5 MB</div>
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button id="btn-decline" class="btn btn-secondary">Recusar</button>
+        <button id="btn-accept" class="btn btn-primary">Aceitar</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast / Barra de Progresso de Transferência Ativa -->
+  <div id="transfer-drawer" class="transfer-drawer hidden">
+    <div class="transfer-card">
+      <div class="transfer-header">
+        <span id="transfer-title" class="transfer-title">Transferindo arquivo...</span>
+        <button id="transfer-cancel-btn" class="btn-icon">✕</button>
+      </div>
+      <div class="progress-bar-bg">
+        <div id="transfer-progress-bar" class="progress-bar-fill"></div>
+      </div>
+      <div class="transfer-stats">
+        <span id="transfer-percent">0%</span>
+        <span id="transfer-speed">0 KB/s</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Script da aplicação Vanilla -->
+  <script src="client.js"></script>
+</body>
+</html>

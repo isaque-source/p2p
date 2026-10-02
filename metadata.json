@@ -1,0 +1,6 @@
+{
+  "name": "DropP2P - Transferência Local P2P",
+  "description": "Aplicação web P2P de transferência direta de arquivos local via WebRTC e sinalização WebSocket no estilo AirDrop e Snapdrop.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
