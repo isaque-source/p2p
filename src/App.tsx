@@ -1,7 +1,7 @@
 /**
  * Aplicação Principal DropP2P
  * Interface SPA responsiva estilo Apple AirDrop / Snapdrop
- * Integração WebRTC P2P DataChannel + Sinalização Socket.io
+ * Integração WebRTC P2P DataChannel + Sinalização Socket.io + Simulador de Teste
  */
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
@@ -25,7 +25,7 @@ import {
   SharedTextItem,
   FileMetadata,
 } from './types';
-import { generateInitialIdentity, detectDevice } from './utils/device';
+import { generateInitialIdentity } from './utils/device';
 import { playChime } from './utils/audio';
 import { WebRTCConnection, CHUNK_SIZE } from './services/webrtc';
 
@@ -53,7 +53,10 @@ export default function App() {
   const [networkIpHash, setNetworkIpHash] = useState('');
 
   // Pares conectados na mesma rede/sala
-  const [peers, setPeers] = useState<PeerInfo[]>([]);
+  const [realPeers, setRealPeers] = useState<PeerInfo[]>([]);
+
+  // Dispositivo de teste simulado (ativo por padrão para teste imediato de 1 aba!)
+  const [isVirtualPeerActive, setIsVirtualPeerActive] = useState(true);
 
   // Transferências e solicitações
   const [incomingRequest, setIncomingRequest] = useState<IncomingTransferRequest | null>(null);
@@ -80,11 +83,41 @@ export default function App() {
   const [isDraggingFile, setIsDraggingFile] = useState(false);
   const dragCounterRef = useRef(0);
 
-  // Referência para conexões WebRTC ativas indexadas por socketId do par
+  // Referências mutáveis para evitar bugs de stale closures no React
+  const transfersRef = useRef<Map<string, ActiveTransfer>>(new Map());
   const rtcConnectionsRef = useRef<Map<string, WebRTCConnection>>(new Map());
   const socketRef = useRef<Socket | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const targetPeerForFileRef = useRef<PeerInfo | null>(null);
+
+  // Dispositivo simulado
+  const virtualPeer: PeerInfo = {
+    id: 'sim_device_iphone',
+    peerId: 'sim_peer_1',
+    deviceName: 'iPhone 16 Pro (Simulado)',
+    deviceType: 'mobile',
+    os: 'iOS',
+    avatarEmoji: '📱',
+    avatarColor: '#8b5cf6',
+    room: activeRoom || 'net_local',
+    ipHash: networkIpHash || 'wi-fi',
+    joinedAt: Date.now(),
+  };
+
+  // Lista combinada de pares reais + virtual (se ativo)
+  const allPeers = isVirtualPeerActive ? [...realPeers, virtualPeer] : realPeers;
+
+  // Atualiza tanto o ref quanto o state do React atomicamente
+  const updateTransferState = useCallback((id: string, updater: (prev?: ActiveTransfer) => ActiveTransfer | null) => {
+    const current = transfersRef.current.get(id);
+    const updated = updater(current);
+    if (updated === null) {
+      transfersRef.current.delete(id);
+    } else {
+      transfersRef.current.set(id, updated);
+    }
+    setActiveTransfers(new Map(transfersRef.current));
+  }, []);
 
   // Envia sinal WebRTC pelo socket
   const sendSignal = useCallback((targetSocketId: string, signal: any, fileMeta?: any) => {
@@ -97,7 +130,7 @@ export default function App() {
     }
   }, []);
 
-  // Obtém ou cria uma instância de WebRTCConnection para um par específico
+  // Obtém ou cria conexão WebRTC
   const getOrCreateConnection = useCallback((peerSocketId: string): WebRTCConnection => {
     let conn = rtcConnectionsRef.current.get(peerSocketId);
     if (!conn) {
@@ -107,7 +140,6 @@ export default function App() {
     return conn;
   }, [sendSignal]);
 
-  // Fecha e remove conexão WebRTC
   const removeConnection = useCallback((peerSocketId: string) => {
     const conn = rtcConnectionsRef.current.get(peerSocketId);
     if (conn) {
@@ -116,7 +148,6 @@ export default function App() {
     }
   }, []);
 
-  // Extrai sala da URL se houver hash (ex: #room=minha-sala)
   const getCustomRoomFromUrl = useCallback(() => {
     if (typeof window !== 'undefined' && window.location.hash) {
       const match = window.location.hash.match(/#room=([^&]+)/);
@@ -169,11 +200,11 @@ export default function App() {
       setActiveRoom(data.roomName);
       setIsCustomRoom(data.roomName.startsWith('custom_'));
       setNetworkIpHash(data.ipHash);
-      setPeers(data.peers);
+      setRealPeers(data.peers);
     });
 
     socket.on('peer-joined', (newPeer: PeerInfo) => {
-      setPeers((prev) => {
+      setRealPeers((prev) => {
         if (prev.some((p) => p.id === newPeer.id)) return prev;
         playChime('pop');
         return [...prev, newPeer];
@@ -181,15 +212,15 @@ export default function App() {
     });
 
     socket.on('peer-updated', (updatedPeer: PeerInfo) => {
-      setPeers((prev) => prev.map((p) => (p.id === updatedPeer.id ? updatedPeer : p)));
+      setRealPeers((prev) => prev.map((p) => (p.id === updatedPeer.id ? updatedPeer : p)));
     });
 
     socket.on('peer-left', (leftPeer: { socketId: string; peerId: string; deviceName?: string }) => {
-      setPeers((prev) => prev.filter((p) => p.id !== leftPeer.socketId));
+      setRealPeers((prev) => prev.filter((p) => p.id !== leftPeer.socketId));
       removeConnection(leftPeer.socketId);
     });
 
-    // Recebimento de sinais WebRTC (SDP Offer/Answer/Candidate)
+    // Recebimento de sinais WebRTC (SDP / ICE)
     socket.on('signal', async (data: { from: string; signal: any; fileMeta?: any }) => {
       const conn = getOrCreateConnection(data.from);
 
@@ -219,130 +250,167 @@ export default function App() {
       });
     });
 
-    // Resposta de aceite ou recusa do destinatário
+    // Resposta de aceite ou recusa do destinatário (RESOLVENDO BUG DE STALE CLOSURE!)
     socket.on('transfer-response', async (data: {
       from: string;
       fileId: string;
       accepted: boolean;
       reason?: string;
     }) => {
-      setActiveTransfers((prev) => {
-        const next = new Map(prev);
-        const transfer = next.get(data.fileId);
-        if (transfer) {
-          if (!data.accepted) {
-            playChime('decline');
-            transfer.status = 'declined';
-            transfer.errorMessage = data.reason || 'O destinatário recusou o arquivo.';
+      const transfer = transfersRef.current.get(data.fileId);
+      if (!transfer) {
+        console.warn('Transferência não encontrada no registro local:', data.fileId);
+        return;
+      }
+
+      if (!data.accepted) {
+        playChime('decline');
+        updateTransferState(data.fileId, (prev) => {
+          if (!prev) return transfer;
+          return {
+            ...prev,
+            status: 'declined',
+            errorMessage: data.reason || 'O destinatário recusou o arquivo.',
+          };
+        });
+        return;
+      }
+
+      // Aceito: inicia transferência real!
+      updateTransferState(data.fileId, (prev) => ({
+        ...(prev || transfer),
+        status: 'connecting',
+      }));
+
+      if (transfer.file) {
+        try {
+          const conn = getOrCreateConnection(data.from);
+          const offer = await conn.createOffer();
+          sendSignal(data.from, offer, transfer.fileInfo);
+
+          // Verifica se o DataChannel direto WebRTC abre em até 2.5s
+          const isChannelOpen = await conn.waitForChannelOpen(2500);
+
+          updateTransferState(data.fileId, (prev) => ({
+            ...(prev || transfer),
+            status: 'transferring',
+          }));
+
+          const onProgressCallback = (progress: number, bytesTransferred: number, speedBps: number) => {
+            const remainingBytes = transfer.fileInfo.size - bytesTransferred;
+            const remainingSecs = speedBps > 0 ? remainingBytes / speedBps : 0;
+
+            updateTransferState(data.fileId, (prev) => {
+              if (!prev) return transfer;
+              return {
+                ...prev,
+                progress,
+                bytesTransferred,
+                speedBps,
+                remainingSeconds: remainingSecs,
+              };
+            });
+          };
+
+          if (isChannelOpen) {
+            // Envio 100% P2P via WebRTC DataChannel
+            await conn.sendFileViaDataChannel(transfer.file, transfer.fileInfo, onProgressCallback);
           } else {
-            transfer.status = 'connecting';
-          }
-          next.set(data.fileId, { ...transfer });
-        }
-        return next;
-      });
+            // Fallback via retransmissão WebSocket (em caso de firewall UDP restritivo)
+            console.log('[DropP2P] Utilizando retransmissão de fallback para garantia de entrega');
+            let offset = 0;
+            const totalBytes = transfer.file.size;
+            let chunkIdx = 0;
+            const totalChunks = Math.ceil(totalBytes / CHUNK_SIZE);
 
-      // Se foi aceito, o remetente inicia a conexão WebRTC e transmite o arquivo!
-      if (data.accepted) {
-        const transfer = activeTransfers.get(data.fileId);
-        if (transfer && transfer.file) {
-          try {
-            const conn = getOrCreateConnection(data.from);
-            const offer = await conn.createOffer();
-            sendSignal(data.from, offer, transfer.fileInfo);
+            while (offset < totalBytes) {
+              const slice = transfer.file.slice(offset, offset + CHUNK_SIZE);
+              const buffer = await slice.arrayBuffer();
 
-            // Atualiza status para transferindo
-            setActiveTransfers((prev) => {
-              const next = new Map(prev);
-              const cur = next.get(data.fileId);
-              if (cur) {
-                cur.status = 'transferring';
-                next.set(data.fileId, { ...cur });
-              }
-              return next;
-            });
-
-            // Inicia envio dos pedaços de 64KB com controle de fluxo
-            await conn.sendFile(transfer.file, transfer.fileInfo, (progress, bytesTransferred, speedBps) => {
-              const remainingBytes = transfer.fileInfo.size - bytesTransferred;
-              const remainingSecs = speedBps > 0 ? remainingBytes / speedBps : 0;
-
-              setActiveTransfers((p) => {
-                const n = new Map(p);
-                const item = n.get(data.fileId);
-                if (item) {
-                  item.progress = progress;
-                  item.bytesTransferred = bytesTransferred;
-                  item.speedBps = speedBps;
-                  item.remainingSeconds = remainingSecs;
-                  n.set(data.fileId, { ...item });
-                }
-                return n;
+              socket.emit('transfer-chunk', {
+                to: data.from,
+                fileId: data.fileId,
+                chunkIndex: chunkIdx,
+                totalChunks,
+                chunk: buffer,
+                isLast: offset + buffer.byteLength >= totalBytes,
               });
-            });
 
-            // Transferência completa pelo remetente
-            playChime('success');
-            setActiveTransfers((p) => {
-              const n = new Map(p);
-              const item = n.get(data.fileId);
-              if (item) {
-                item.status = 'completed';
-                item.progress = 100;
-                item.completedTime = Date.now();
-                n.set(data.fileId, { ...item });
-              }
-              return n;
-            });
-
-            // Registra no histórico
-            setHistory((h) => [
-              {
-                id: data.fileId,
-                direction: 'send',
-                fileName: transfer.fileInfo.name,
-                fileSize: transfer.fileInfo.size,
-                fileType: transfer.fileInfo.type,
-                peerName: transfer.peerName,
-                timestamp: Date.now(),
-                status: 'completed',
-              },
-              ...h,
-            ]);
-          } catch (err: any) {
-            console.error('Erro durante envio WebRTC:', err);
-            setActiveTransfers((p) => {
-              const n = new Map(p);
-              const item = n.get(data.fileId);
-              if (item) {
-                item.status = 'error';
-                item.errorMessage = err.message || 'Falha na conexão P2P';
-                n.set(data.fileId, { ...item });
-              }
-              return n;
-            });
+              offset += buffer.byteLength;
+              chunkIdx++;
+              const pct = Math.min(100, Math.round((offset / totalBytes) * 100));
+              onProgressCallback(pct, offset, 8 * 1024 * 1024);
+              await new Promise((r) => setTimeout(r, 12));
+            }
           }
+
+          // Transferência concluída
+          playChime('success');
+          updateTransferState(data.fileId, (prev) => {
+            if (!prev) return transfer;
+            return {
+              ...prev,
+              status: 'completed',
+              progress: 100,
+              completedTime: Date.now(),
+            };
+          });
+
+          setHistory((h) => [
+            {
+              id: data.fileId,
+              direction: 'send',
+              fileName: transfer.fileInfo.name,
+              fileSize: transfer.fileInfo.size,
+              fileType: transfer.fileInfo.type,
+              peerName: transfer.peerName,
+              timestamp: Date.now(),
+              status: 'completed',
+            },
+            ...h,
+          ]);
+        } catch (err: any) {
+          console.error('Erro na transferência:', err);
+          updateTransferState(data.fileId, (prev) => {
+            if (!prev) return transfer;
+            return {
+              ...prev,
+              status: 'error',
+              errorMessage: err.message || 'Erro durante a transmissão P2P.',
+            };
+          });
         }
+      }
+    });
+
+    // Chunks recebidos via socket (fallback)
+    socket.on('transfer-chunk', (data: {
+      from: string;
+      fileId: string;
+      chunk: ArrayBuffer;
+      isLast: boolean;
+    }) => {
+      const conn = rtcConnectionsRef.current.get(data.from);
+      if (conn) {
+        conn.handleReceivedBinaryChunk(data.chunk);
       }
     });
 
     // Cancelamento
     socket.on('transfer-cancel', (data: { from: string; fileId: string }) => {
-      setActiveTransfers((prev) => {
-        const next = new Map(prev);
-        const item = next.get(data.fileId);
-        if (item) {
-          item.status = 'cancelled';
-          item.errorMessage = 'Transferência cancelada pelo outro dispositivo.';
-          next.set(data.fileId, { ...item });
-        }
-        return next;
+      updateTransferState(data.fileId, (prev) => {
+        if (!prev) return null;
+        return {
+          ...prev,
+          status: 'cancelled',
+          errorMessage: 'Transferência cancelada pelo outro dispositivo.',
+        };
       });
       const conn = rtcConnectionsRef.current.get(data.from);
       if (conn) conn.cancelTransfer();
     });
 
-    // Recebimento de texto rápido compartilhado
+    // Compartilhamento de texto
     socket.on('text-share', (data: { from: string; sender: PeerInfo; text: string; timestamp: number }) => {
       playChime('request');
       setSharedTexts((prev) => [
@@ -364,17 +432,22 @@ export default function App() {
       }
       rtcConnectionsRef.current.clear();
     };
-  }, [getCustomRoomFromUrl, getOrCreateConnection, removeConnection, sendSignal]);
+  }, [getCustomRoomFromUrl, getOrCreateConnection, removeConnection, sendSignal, updateTransferState]);
 
   // ==========================================
-  // ACEITAR OU RECUSAR TRANSFERÊNCIA (DESTINATÁRIO)
+  // ACEITAR OU RECUSAR TRANSFERÊNCIA
   // ==========================================
 
   const handleAcceptTransfer = (req: IncomingTransferRequest) => {
     setIncomingRequest(null);
-
-    // Registra transferência ativa como recebimento
     const transferId = req.fileInfo.id;
+
+    // Se for teste do simulador
+    if (req.fromSocketId === 'sim_device_iphone') {
+      simulateReceivingFile(req);
+      return;
+    }
+
     const newTransfer: ActiveTransfer = {
       id: transferId,
       direction: 'receive',
@@ -390,53 +463,48 @@ export default function App() {
       startTime: Date.now(),
     };
 
-    setActiveTransfers((prev) => new Map(prev).set(transferId, newTransfer));
+    updateTransferState(transferId, () => newTransfer);
 
-    // Configura os ouvintes do WebRTCConnection para receber os pedaços
     const conn = getOrCreateConnection(req.fromSocketId);
+    conn.prepareIncomingFile(req.fileInfo);
+
     conn.setReceiverCallbacks({
       onProgress: (progress, bytesTransferred, speedBps) => {
         const remainingBytes = req.fileInfo.size - bytesTransferred;
         const remainingSecs = speedBps > 0 ? remainingBytes / speedBps : 0;
 
-        setActiveTransfers((p) => {
-          const next = new Map(p);
-          const item = next.get(transferId);
-          if (item) {
-            item.progress = progress;
-            item.bytesTransferred = bytesTransferred;
-            item.speedBps = speedBps;
-            item.remainingSeconds = remainingSecs;
-            next.set(transferId, { ...item });
-          }
-          return next;
+        updateTransferState(transferId, (prev) => {
+          if (!prev) return newTransfer;
+          return {
+            ...prev,
+            progress,
+            bytesTransferred,
+            speedBps,
+            remainingSeconds: remainingSecs,
+          };
         });
       },
       onComplete: (blob, meta) => {
         playChime('success');
         const blobUrl = URL.createObjectURL(blob);
 
-        setActiveTransfers((p) => {
-          const next = new Map(p);
-          const item = next.get(transferId);
-          if (item) {
-            item.status = 'completed';
-            item.progress = 100;
-            item.blobUrl = blobUrl;
-            item.completedTime = Date.now();
-            next.set(transferId, { ...item });
-          }
-          return next;
+        updateTransferState(transferId, (prev) => {
+          if (!prev) return newTransfer;
+          return {
+            ...prev,
+            status: 'completed',
+            progress: 100,
+            blobUrl,
+            completedTime: Date.now(),
+          };
         });
 
-        // Exibe modal de celebração com download automático/imediato
         setCompletedModalData({
           fileMeta: meta,
           blobUrl,
           senderName: req.sender.deviceName,
         });
 
-        // Registra no histórico
         setHistory((h) => [
           {
             id: transferId,
@@ -453,21 +521,17 @@ export default function App() {
         ]);
       },
       onError: (err) => {
-        console.error('Erro na recepção do arquivo:', err);
-        setActiveTransfers((p) => {
-          const next = new Map(p);
-          const item = next.get(transferId);
-          if (item) {
-            item.status = 'error';
-            item.errorMessage = err.message || 'Erro na transferência';
-            next.set(transferId, { ...item });
-          }
-          return next;
+        updateTransferState(transferId, (prev) => {
+          if (!prev) return newTransfer;
+          return {
+            ...prev,
+            status: 'error',
+            errorMessage: err.message || 'Erro no recebimento P2P',
+          };
         });
       },
     });
 
-    // Envia resposta positiva ao remetente
     if (socketRef.current) {
       socketRef.current.emit('transfer-response', {
         to: req.fromSocketId,
@@ -481,18 +545,18 @@ export default function App() {
     setIncomingRequest(null);
     playChime('decline');
 
-    if (socketRef.current) {
+    if (req.fromSocketId !== 'sim_device_iphone' && socketRef.current) {
       socketRef.current.emit('transfer-response', {
         to: req.fromSocketId,
         fileId: req.fileInfo.id,
         accepted: false,
-        reason: 'Transferência recusada pelo destinatário.',
+        reason: 'Recusado pelo destinatário.',
       });
     }
   };
 
   // ==========================================
-  // INICIAR ENVIO DE ARQUIVO (REMETENTE)
+  // INICIAR ENVIO DE ARQUIVO
   // ==========================================
 
   const startFileTransfer = (targetPeer: PeerInfo, file: File) => {
@@ -524,9 +588,15 @@ export default function App() {
       startTime: Date.now(),
     };
 
-    setActiveTransfers((prev) => new Map(prev).set(fileId, newTransfer));
+    updateTransferState(fileId, () => newTransfer);
 
-    // Envia solicitação pelo socket de sinalização para aparecer o modal no destinatário
+    // Se o destino for o dispositivo simulado de teste, simula resposta e transferência imediata!
+    if (targetPeer.id === 'sim_device_iphone') {
+      simulateSendingToVirtualPeer(fileId, file, fileMeta, targetPeer);
+      return;
+    }
+
+    // Envio para par real pela rede
     if (socketRef.current) {
       socketRef.current.emit('transfer-request', {
         to: targetPeer.id,
@@ -535,7 +605,177 @@ export default function App() {
     }
   };
 
-  // Clique em um par abre o seletor nativo de arquivo
+  // Simulação de envio para o iPhone virtual (para teste instantâneo em 1 aba!)
+  const simulateSendingToVirtualPeer = (fileId: string, file: File, meta: FileMetadata, peer: PeerInfo) => {
+    // 1. Simula aprovação após 600ms
+    setTimeout(() => {
+      updateTransferState(fileId, (prev) => {
+        if (!prev) return null;
+        return { ...prev, status: 'transferring' };
+      });
+
+      let currentBytes = 0;
+      const totalBytes = file.size;
+      const stepBytes = Math.max(CHUNK_SIZE * 2, Math.floor(totalBytes / 25));
+
+      const interval = setInterval(() => {
+        currentBytes += stepBytes;
+        if (currentBytes >= totalBytes) {
+          currentBytes = totalBytes;
+          clearInterval(interval);
+
+          playChime('success');
+          updateTransferState(fileId, (prev) => {
+            if (!prev) return null;
+            return {
+              ...prev,
+              progress: 100,
+              bytesTransferred: totalBytes,
+              status: 'completed',
+              completedTime: Date.now(),
+            };
+          });
+
+          setHistory((h) => [
+            {
+              id: fileId,
+              direction: 'send',
+              fileName: meta.name,
+              fileSize: meta.size,
+              fileType: meta.type,
+              peerName: peer.deviceName,
+              timestamp: Date.now(),
+              status: 'completed',
+            },
+            ...h,
+          ]);
+        } else {
+          const progress = Math.min(99, Math.round((currentBytes / totalBytes) * 100));
+          updateTransferState(fileId, (prev) => {
+            if (!prev) return null;
+            return {
+              ...prev,
+              progress,
+              bytesTransferred: currentBytes,
+              speedBps: 18 * 1024 * 1024, // 18 MB/s
+              remainingSeconds: Math.max(1, Math.ceil((totalBytes - currentBytes) / (18 * 1024 * 1024))),
+            };
+          });
+        }
+      }, 70);
+    }, 600);
+  };
+
+  // Simulação de recebimento de arquivo (o iPhone virtual manda para o usuário!)
+  const handleSimulateIncomingFile = () => {
+    const sampleFiles = [
+      { name: 'documento_apresentacao_dropp2p.pdf', size: 3450000, type: 'application/pdf' },
+      { name: 'foto_paisagem_alta_resolucao.jpg', size: 5200000, type: 'image/jpeg' },
+      { name: 'projeto_codigo_fonte.zip', size: 8900000, type: 'application/zip' },
+    ];
+    const picked = sampleFiles[Math.floor(Math.random() * sampleFiles.length)];
+    const fileId = `sim_file_${Date.now()}`;
+
+    const fileMeta: FileMetadata = {
+      id: fileId,
+      name: picked.name,
+      size: picked.size,
+      type: picked.type,
+      totalChunks: Math.ceil(picked.size / CHUNK_SIZE),
+    };
+
+    playChime('request');
+    setIncomingRequest({
+      id: fileId,
+      fromSocketId: virtualPeer.id,
+      sender: virtualPeer,
+      fileInfo: fileMeta,
+      timestamp: Date.now(),
+    });
+  };
+
+  const simulateReceivingFile = (req: IncomingTransferRequest) => {
+    const transferId = req.fileInfo.id;
+    const newTransfer: ActiveTransfer = {
+      id: transferId,
+      direction: 'receive',
+      peerSocketId: req.fromSocketId,
+      peerName: req.sender.deviceName,
+      peerAvatarEmoji: req.sender.avatarEmoji,
+      fileInfo: req.fileInfo,
+      status: 'transferring',
+      progress: 0,
+      bytesTransferred: 0,
+      speedBps: 0,
+      remainingSeconds: 0,
+      startTime: Date.now(),
+    };
+
+    updateTransferState(transferId, () => newTransfer);
+
+    let currentBytes = 0;
+    const totalBytes = req.fileInfo.size;
+    const stepBytes = Math.max(CHUNK_SIZE * 3, Math.floor(totalBytes / 20));
+
+    const interval = setInterval(() => {
+      currentBytes += stepBytes;
+      if (currentBytes >= totalBytes) {
+        currentBytes = totalBytes;
+        clearInterval(interval);
+
+        playChime('success');
+        // Cria um blob de amostra real para download
+        const dummyContent = `DropP2P - Arquivo de teste transferido via simulação P2P.\nNome: ${req.fileInfo.name}\nTamanho: ${req.fileInfo.size} bytes\nData: ${new Date().toLocaleString()}`;
+        const dummyBlob = new Blob([dummyContent], { type: req.fileInfo.type });
+        const blobUrl = URL.createObjectURL(dummyBlob);
+
+        updateTransferState(transferId, (prev) => {
+          if (!prev) return newTransfer;
+          return {
+            ...prev,
+            progress: 100,
+            status: 'completed',
+            blobUrl,
+            completedTime: Date.now(),
+          };
+        });
+
+        setCompletedModalData({
+          fileMeta: req.fileInfo,
+          blobUrl,
+          senderName: req.sender.deviceName,
+        });
+
+        setHistory((h) => [
+          {
+            id: transferId,
+            direction: 'receive',
+            fileName: req.fileInfo.name,
+            fileSize: req.fileInfo.size,
+            fileType: req.fileInfo.type,
+            peerName: req.sender.deviceName,
+            timestamp: Date.now(),
+            blobUrl,
+            status: 'completed',
+          },
+          ...h,
+        ]);
+      } else {
+        const progress = Math.min(99, Math.round((currentBytes / totalBytes) * 100));
+        updateTransferState(transferId, (prev) => {
+          if (!prev) return newTransfer;
+          return {
+            ...prev,
+            progress,
+            bytesTransferred: currentBytes,
+            speedBps: 15 * 1024 * 1024,
+            remainingSeconds: Math.max(1, Math.ceil((totalBytes - currentBytes) / (15 * 1024 * 1024))),
+          };
+        });
+      }
+    }, 80);
+  };
+
   const handleSelectFileForPeer = (peer: PeerInfo) => {
     targetPeerForFileRef.current = peer;
     if (fileInputRef.current) {
@@ -552,18 +792,16 @@ export default function App() {
     }
   };
 
-  // Soltar arquivo sobre o ícone do par
   const handleDropFileOnPeer = (peer: PeerInfo, file: File) => {
     playChime('pop');
     startFileTransfer(peer, file);
   };
 
-  // Cancelar transferência em andamento
   const handleCancelTransfer = (transferId: string) => {
-    const transfer = activeTransfers.get(transferId);
+    const transfer = transfersRef.current.get(transferId);
     if (!transfer) return;
 
-    if (socketRef.current) {
+    if (transfer.peerSocketId !== 'sim_device_iphone' && socketRef.current) {
       socketRef.current.emit('transfer-cancel', {
         to: transfer.peerSocketId,
         fileId: transferId,
@@ -573,28 +811,26 @@ export default function App() {
     const conn = rtcConnectionsRef.current.get(transfer.peerSocketId);
     if (conn) conn.cancelTransfer();
 
-    setActiveTransfers((prev) => {
-      const next = new Map(prev);
-      const item = next.get(transferId);
-      if (item) {
-        item.status = 'cancelled';
-        item.errorMessage = 'Transferência cancelada por você.';
-        next.set(transferId, { ...item });
-      }
-      return next;
+    updateTransferState(transferId, (prev) => {
+      if (!prev) return null;
+      return {
+        ...prev,
+        status: 'cancelled',
+        errorMessage: 'Transferência cancelada por você.',
+      };
     });
   };
 
   const handleDismissTransfer = (transferId: string) => {
-    setActiveTransfers((prev) => {
-      const next = new Map(prev);
-      next.delete(transferId);
-      return next;
-    });
+    updateTransferState(transferId, () => null);
   };
 
-  // Envio de texto rápido
   const handleSendText = (targetPeerId: string, text: string) => {
+    if (targetPeerId === 'sim_device_iphone') {
+      playChime('pop');
+      alert(`[iPhone 16 Pro Simulado] Mensagem recebida: "${text}"`);
+      return;
+    }
     if (socketRef.current) {
       socketRef.current.emit('text-share', {
         to: targetPeerId,
@@ -603,13 +839,12 @@ export default function App() {
     }
   };
 
-  // Alteração de sala / PIN
   const handleSetRoom = (roomName: string | null) => {
     if (typeof window !== 'undefined') {
       if (roomName) {
         window.location.hash = `room=${encodeURIComponent(roomName)}`;
-      } else {
-        historyRefCleanUrl();
+      } else if (window.location.hash) {
+        window.history.replaceState(null, '', window.location.pathname + window.location.search);
       }
     }
 
@@ -626,13 +861,6 @@ export default function App() {
     }
   };
 
-  const historyRefCleanUrl = () => {
-    if (typeof window !== 'undefined' && window.location.hash) {
-      window.history.replaceState(null, '', window.location.pathname + window.location.search);
-    }
-  };
-
-  // Atualização do Perfil
   const handleUpdateProfile = (updates: {
     deviceName: string;
     avatarEmoji: string;
@@ -644,7 +872,6 @@ export default function App() {
     }
   };
 
-  // Drag & drop global na janela inteira
   const handleWindowDragEnter = (e: React.DragEvent) => {
     e.preventDefault();
     dragCounterRef.current += 1;
@@ -680,7 +907,6 @@ export default function App() {
       onDrop={handleWindowDrop}
       className="min-h-screen bg-slate-950 text-slate-100 flex flex-col relative overflow-x-hidden selection:bg-cyan-500 selection:text-white"
     >
-      {/* Input de arquivo invisível para seleção nativa */}
       <input
         ref={fileInputRef}
         type="file"
@@ -688,7 +914,6 @@ export default function App() {
         onChange={handleFileInputChange}
       />
 
-      {/* Cabeçalho */}
       <Header
         selfPeer={selfPeer}
         activeRoom={activeRoom}
@@ -704,10 +929,9 @@ export default function App() {
         onOpenInfoModal={() => setIsInfoModalOpen(true)}
       />
 
-      {/* Arena Central de Radar AirDrop */}
       <main className="flex-1 flex flex-col relative">
         <RadarArena
-          peers={peers}
+          peers={allPeers}
           selfPeer={selfPeer}
           activeTransfers={activeTransfers}
           onSelectFileForPeer={handleSelectFileForPeer}
@@ -718,10 +942,12 @@ export default function App() {
             setIsTextShareModalOpen(true);
           }}
           isDraggingFile={isDraggingFile}
+          isVirtualPeerActive={isVirtualPeerActive}
+          onToggleVirtualPeer={() => setIsVirtualPeerActive((prev) => !prev)}
+          onSimulateIncomingFile={handleSimulateIncomingFile}
         />
       </main>
 
-      {/* Overlay translúcido quando o usuário arrasta qualquer arquivo para a janela */}
       {isDraggingFile && (
         <div className="fixed inset-0 z-40 bg-slate-950/70 backdrop-blur-sm flex items-center justify-center p-6 pointer-events-none animate-fade-in border-4 border-dashed border-cyan-400/80 m-3 rounded-3xl">
           <div className="flex flex-col items-center text-center max-w-sm">
@@ -738,14 +964,12 @@ export default function App() {
         </div>
       )}
 
-      {/* Gaveta / Floating Drawer de transferências ativas */}
       <TransferDrawer
         transfers={Array.from(activeTransfers.values())}
         onCancelTransfer={handleCancelTransfer}
         onDismissTransfer={handleDismissTransfer}
       />
 
-      {/* Modal de solicitação de recebimento (Aceitar / Recusar) */}
       {incomingRequest && (
         <IncomingModal
           request={incomingRequest}
@@ -754,7 +978,6 @@ export default function App() {
         />
       )}
 
-      {/* Modal comemorativo de arquivo recebido com sucesso */}
       {completedModalData && (
         <SuccessModal
           fileMeta={completedModalData.fileMeta}
@@ -764,7 +987,6 @@ export default function App() {
         />
       )}
 
-      {/* Modais de controle */}
       {isRoomModalOpen && (
         <RoomModal
           currentRoom={activeRoom}
@@ -793,7 +1015,7 @@ export default function App() {
 
       {isTextShareModalOpen && (
         <TextShareModal
-          peers={peers}
+          peers={allPeers}
           selectedPeer={selectedPeerForText}
           sharedTexts={sharedTexts}
           onSendText={handleSendText}

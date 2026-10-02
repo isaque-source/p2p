@@ -225,6 +225,28 @@ io.on('connection', (socket: Socket) => {
     }
   });
 
+  // Retransmissão de chunks em caso de fallback quando WebRTC DataChannel não conseguir furar NAT
+  socket.on('transfer-chunk', (data: {
+    to: string;
+    fileId: string;
+    chunkIndex: number;
+    totalChunks: number;
+    chunk: any;
+    isLast: boolean;
+  }) => {
+    const targetSocket = io.sockets.sockets.get(data.to);
+    if (targetSocket) {
+      targetSocket.emit('transfer-chunk', {
+        from: socket.id,
+        fileId: data.fileId,
+        chunkIndex: data.chunkIndex,
+        totalChunks: data.totalChunks,
+        chunk: data.chunk,
+        isLast: data.isLast,
+      });
+    }
+  });
+
   // Compartilhamento rápido de texto/link/área de transferência
   socket.on('text-share', (data: { to: string; text: string }) => {
     const targetSocket = io.sockets.sockets.get(data.to);

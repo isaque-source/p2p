@@ -168,7 +168,7 @@
       if (!activeTransfer || activeTransfer.fileId !== fileId) return;
 
       if (!accepted) {
-        alert(reason || 'O destinatário recusou o arquivo.');
+        console.warn(reason || 'O destinatário recusou o arquivo.');
         hideTransferDrawer();
         return;
       }
@@ -233,7 +233,6 @@
           const blob = new Blob(receivedChunks, { type: incomingMeta.type });
           triggerDownload(blob, incomingMeta.name);
           hideTransferDrawer();
-          alert('Arquivo ' + incomingMeta.name + ' recebido com sucesso!');
         }
       } else if (event.data instanceof ArrayBuffer) {
         receivedChunks.push(event.data);
@@ -282,7 +281,7 @@
     // 2. Envia sinal de término
     channel.send(JSON.stringify({ type: 'file-complete' }));
     hideTransferDrawer();
-    alert('Arquivo enviado com sucesso!');
+    console.log('Arquivo enviado com sucesso!');
   }
 
   // Renderiza pares descobertos na tela

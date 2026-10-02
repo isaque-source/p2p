@@ -1,7 +1,7 @@
 /**
- * Gerenciador WebRTC P2P (RTCPeerConnection + RTCDataChannel)
+ * Gerenciador WebRTC P2P (RTCPeerConnection + RTCDataChannel) com Fallback Relay
  * Suporta transferência direta de arquivos em pedaços (chunking de 64KB)
- * com controle de backpressure (bufferedAmountLowThreshold) e sem perdas de pacotes.
+ * com controle de backpressure (bufferedAmountLowThreshold) e fallback automático.
  */
 
 import { FileMetadata } from '../types';
@@ -29,7 +29,7 @@ export class WebRTCConnection {
   public dataChannel: RTCDataChannel | null = null;
   private pendingCandidates: RTCIceCandidateInit[] = [];
   private isRemoteDescriptionSet = false;
-  private sendSignal: (targetSocketId: string, signal: any) => void;
+  private sendSignal: (targetSocketId: string, signal: any, fileMeta?: any) => void;
 
   // Estado de recepção de arquivo
   private incomingMeta: FileMetadata | null = null;
@@ -42,7 +42,7 @@ export class WebRTCConnection {
 
   constructor(
     peerSocketId: string,
-    sendSignal: (targetSocketId: string, signal: any) => void
+    sendSignal: (targetSocketId: string, signal: any, fileMeta?: any) => void
   ) {
     this.peerSocketId = peerSocketId;
     this.sendSignal = sendSignal;
@@ -64,7 +64,7 @@ export class WebRTCConnection {
 
     this.pc.onconnectionstatechange = () => {
       if (this.pc.connectionState === 'failed' || this.pc.connectionState === 'disconnected') {
-        // Conexão perdida
+        // Conexão direta falhou
       }
     };
   }
@@ -88,7 +88,7 @@ export class WebRTCConnection {
             this.speedSamples = [{ time: performance.now(), bytes: 0 }];
             this.lastProgressReport = performance.now();
           } else if (msg.type === 'file-complete') {
-            if (this.incomingMeta) {
+            if (this.incomingMeta && this.receivedChunks.length > 0) {
               const fileBlob = new Blob(this.receivedChunks, {
                 type: this.incomingMeta.type || 'application/octet-stream',
               });
@@ -103,44 +103,53 @@ export class WebRTCConnection {
           console.error('Erro ao analisar mensagem de controle:', e);
         }
       } else if (event.data instanceof ArrayBuffer) {
-        // Pedaço binário do arquivo
-        if (!this.incomingMeta) return;
-
-        this.receivedChunks.push(event.data);
-        this.receivedBytes += event.data.byteLength;
-
-        const now = performance.now();
-        // Atualiza progresso a cada 80ms para suavidade na interface
-        if (now - this.lastProgressReport > 80 || this.receivedBytes >= this.incomingMeta.size) {
-          const progress = Math.min(100, Math.round((this.receivedBytes / this.incomingMeta.size) * 100));
-
-          // Cálculo de velocidade instantânea
-          this.speedSamples.push({ time: now, bytes: this.receivedBytes });
-          if (this.speedSamples.length > 10) this.speedSamples.shift();
-
-          const oldest = this.speedSamples[0];
-          const timeDelta = (now - oldest.time) / 1000;
-          const bytesDelta = this.receivedBytes - oldest.bytes;
-          const speedBps = timeDelta > 0 ? Math.round(bytesDelta / timeDelta) : 0;
-
-          this.transferCallbacks.onProgress?.(progress, this.receivedBytes, speedBps);
-          this.lastProgressReport = now;
-        }
-
-        // Se já recebeu todos os bytes esperados, finaliza caso o pacote de controle demore
-        if (this.receivedBytes >= this.incomingMeta.size && this.incomingMeta.size > 0) {
-          setTimeout(() => {
-            if (this.receivedChunks.length > 0 && this.incomingMeta) {
-              const fileBlob = new Blob(this.receivedChunks, {
-                type: this.incomingMeta.type || 'application/octet-stream',
-              });
-              this.transferCallbacks.onComplete?.(fileBlob, this.incomingMeta);
-              this.receivedChunks = [];
-            }
-          }, 50);
-        }
+        this.handleReceivedBinaryChunk(event.data);
       }
     };
+  }
+
+  // Processa pedaço binário recebido
+  public handleReceivedBinaryChunk(arrayBuffer: ArrayBuffer) {
+    if (!this.incomingMeta) return;
+
+    this.receivedChunks.push(arrayBuffer);
+    this.receivedBytes += arrayBuffer.byteLength;
+
+    const now = performance.now();
+    if (now - this.lastProgressReport > 70 || this.receivedBytes >= this.incomingMeta.size) {
+      const progress = Math.min(100, Math.round((this.receivedBytes / this.incomingMeta.size) * 100));
+
+      this.speedSamples.push({ time: now, bytes: this.receivedBytes });
+      if (this.speedSamples.length > 10) this.speedSamples.shift();
+
+      const oldest = this.speedSamples[0];
+      const timeDelta = (now - oldest.time) / 1000;
+      const bytesDelta = this.receivedBytes - oldest.bytes;
+      const speedBps = timeDelta > 0 ? Math.round(bytesDelta / timeDelta) : 0;
+
+      this.transferCallbacks.onProgress?.(progress, this.receivedBytes, speedBps);
+      this.lastProgressReport = now;
+    }
+
+    if (this.receivedBytes >= this.incomingMeta.size && this.incomingMeta.size > 0) {
+      setTimeout(() => {
+        if (this.receivedChunks.length > 0 && this.incomingMeta) {
+          const fileBlob = new Blob(this.receivedChunks, {
+            type: this.incomingMeta.type || 'application/octet-stream',
+          });
+          this.transferCallbacks.onComplete?.(fileBlob, this.incomingMeta);
+          this.receivedChunks = [];
+        }
+      }, 50);
+    }
+  }
+
+  public prepareIncomingFile(meta: FileMetadata) {
+    this.incomingMeta = meta;
+    this.receivedChunks = [];
+    this.receivedBytes = 0;
+    this.speedSamples = [{ time: performance.now(), bytes: 0 }];
+    this.lastProgressReport = performance.now();
   }
 
   // Define os callbacks para escutar o progresso do recebimento
@@ -206,46 +215,43 @@ export class WebRTCConnection {
     }
   }
 
-  // Espera que o DataChannel esteja aberto antes de iniciar transmissão
-  public async waitForChannelOpen(): Promise<void> {
+  // Aguarda abertura do canal com timeout rápido
+  public async waitForChannelOpen(timeoutMs = 3000): Promise<boolean> {
     if (this.dataChannel && this.dataChannel.readyState === 'open') {
-      return;
+      return true;
     }
-    return new Promise((resolve, reject) => {
+    return new Promise((resolve) => {
       const checkInterval = setInterval(() => {
         if (this.dataChannel && this.dataChannel.readyState === 'open') {
           clearInterval(checkInterval);
-          resolve();
+          resolve(true);
         } else if (this.pc.connectionState === 'failed' || this.pc.connectionState === 'closed') {
           clearInterval(checkInterval);
-          reject(new Error('Conexão WebRTC fechada antes da abertura do canal.'));
+          resolve(false);
         }
       }, 50);
 
-      // Timeout após 20 segundos
       setTimeout(() => {
         clearInterval(checkInterval);
-        if (!this.dataChannel || this.dataChannel.readyState !== 'open') {
-          reject(new Error('Tempo limite para abertura do canal WebRTC excedido.'));
-        }
-      }, 20000);
+        resolve(this.dataChannel?.readyState === 'open');
+      }, timeoutMs);
     });
   }
 
   /**
-   * Envia um arquivo fatiado em pedaços de 64KB com controle de backpressure.
-   * Não sobrecarrega a memória nem perde pacotes em arquivos gigantes.
+   * Envia arquivo diretamente pelo DataChannel WebRTC
    */
-  public async sendFile(
+  public async sendFileViaDataChannel(
     file: File,
     fileMeta: FileMetadata,
     onProgress?: (progress: number, bytesTransferred: number, speedBps: number) => void
   ): Promise<void> {
     this.isCancelled = false;
-    await this.waitForChannelOpen();
-    if (!this.dataChannel) throw new Error('DataChannel não disponível');
+    if (!this.dataChannel || this.dataChannel.readyState !== 'open') {
+      throw new Error('DataChannel não está aberto');
+    }
 
-    // 1. Envia metadados do arquivo em JSON
+    // Envia metadados
     this.dataChannel.send(
       JSON.stringify({
         type: 'file-meta',
@@ -262,10 +268,9 @@ export class WebRTCConnection {
 
     while (offset < totalBytes) {
       if (this.isCancelled) {
-        throw new Error('Transferência cancelada pelo usuário.');
+        throw new Error('Transferência cancelada.');
       }
 
-      // Controle de Backpressure: se o buffer da placa de rede passar de 1MB, aguarda esvaziar
       if (this.dataChannel.bufferedAmount > BUFFER_THRESHOLD) {
         await new Promise<void>((resolve) => {
           if (!this.dataChannel) return resolve();
@@ -276,16 +281,14 @@ export class WebRTCConnection {
         });
       }
 
-      // Lê a fatia de 64KB do arquivo do disco/memória
       const slice = file.slice(offset, offset + CHUNK_SIZE);
       const arrayBuffer = await slice.arrayBuffer();
 
       this.dataChannel.send(arrayBuffer);
       offset += arrayBuffer.byteLength;
 
-      // Reporta progresso e velocidade
       const now = performance.now();
-      if (now - lastReport > 80 || offset >= totalBytes) {
+      if (now - lastReport > 70 || offset >= totalBytes) {
         const progress = Math.min(100, Math.round((offset / totalBytes) * 100));
 
         speedSamples.push({ time: now, bytes: offset });
@@ -301,26 +304,12 @@ export class WebRTCConnection {
       }
     }
 
-    // 2. Envia sinal de término de arquivo
     this.dataChannel.send(
       JSON.stringify({
         type: 'file-complete',
         fileId: fileMeta.id,
       })
     );
-  }
-
-  // Envia texto puro (área de transferência ou notas) diretamente pelo DataChannel
-  public sendText(text: string) {
-    if (this.dataChannel && this.dataChannel.readyState === 'open') {
-      this.dataChannel.send(
-        JSON.stringify({
-          type: 'text-msg',
-          text,
-          timestamp: Date.now(),
-        })
-      );
-    }
   }
 
   public cancelTransfer() {
